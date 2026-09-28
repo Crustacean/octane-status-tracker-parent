@@ -29,6 +29,7 @@ def pipelineConfigurationDefaults() {
     'OCTANE_POLL_INTERVAL_SECONDS': '1',
     'OCTANE_BASE_PASSRATE_FIGURE': '95',
     'OCTANE_BASE_EXECUTION_FIGURE': '100',
+    'LIMIT_FOR_METRIC_RUNS_IN_SUITE': '250',
     'OCTANE_MARK_UNSTABLE': 'false',
     'OCTANE_CRITERIA': '''
       (regressions.executionRate == 100 AND regressions.passRate >= 95)
@@ -50,10 +51,11 @@ def pipelineConfigurationDefaults() {
     'OCTANE_EMAIL_CC': '',
     'OCTANE_EMAIL_BCC': '',
     'OCTANE_EMAIL_FROM': 'jenkins-notifications@example.com',
-    'OCTANE_EMAIL_REPLY_TO': 'qa-team@example.com',
+    'OCTANE_EMAIL_REPLY_TO': '',
     'OCTANE_EMAIL_PRINT_DEFECT_GROUPS': 'true',
     'PROJECT_SUMMARY': '',
     'PRINT_PROJECT_SUMMARY_ON_INTERVAL_EMAILS': 'false',
+    'PRINT_TESTERS_ON_EMAIL_BODY': 'false',
     'PRINT_DEFECTS_ON_EMAIL_BODY': 'false',
     'PRINT_DEFECTS_ON_EMAIL_BODY_FILTER': '',
     'PRINT_DEFECTS_ON_EMAIL_BODY_LIMIT': '100',
@@ -64,7 +66,12 @@ def pipelineConfigurationDefaults() {
     'OCTANE_INTERVAL_EMAIL_IS_IMPORTANT': 'false',
     'OCTANE_FINAL_EMAIL_ON_FAILURE': 'UNSTABLE',
     'OCTANE_FINAL_EMAIL_ARCHIVE_SCREENSHOT': 'true',
-    'OCTANE_FINAL_EMAIL_IS_IMPORTANT': 'false'
+    'OCTANE_FINAL_EMAIL_IS_IMPORTANT': 'false',
+    'AUTOMATION_SUITE_CREDENTIAL_ID': '',
+    'ARGOCD_SYNC_REPO_URL': '',
+    'ARGOCD_SYNC_BRANCH': 'develop',
+    'ARGOCD_STATE_FILE_PATH': '',
+    'ARGOCD_GIT_CREDENTIAL_ID': ''
   ]
 }
 
@@ -173,6 +180,105 @@ def resolveOctaneConnection(
   ]
 }
 
+def normalizeAutomationSuiteCredentialId(Object configuredValue) {
+  String value = configuredValue?.toString()?.trim()
+  return !value || value.toLowerCase() in ['null', 'undefined'] ? '' : value
+}
+
+def writeAutomationSuiteEnvironmentFile(String credentialKind) {
+  withEnv(["AUTOMATION_SUITE_CREDENTIAL_KIND=${credentialKind}"]) {
+    sh(
+        label: 'Generate secure automation suite environment',
+        script: '''#!/bin/sh
+          set +x
+          set -eu
+          umask 077
+
+          env_file=$AUTOMATION_SUITE_ENV_FILE
+          temporary_file="${env_file}.tmp.$$"
+          trap 'rm -f -- "$temporary_file"' EXIT HUP INT TERM
+
+          dotenv_escape() {
+            value_to_escape=$1
+            line_break_count=$(printf '%s' "$value_to_escape" | wc -l)
+            carriage_return=$(printf '\r')
+            if [ "$line_break_count" -ne 0 ]; then
+              echo 'Automation suite credentials must not contain line breaks.' >&2
+              exit 64
+            fi
+            case "$value_to_escape" in
+              *"$carriage_return"*)
+                echo 'Automation suite credentials must not contain line breaks.' >&2
+                exit 64
+                ;;
+            esac
+            printf '%s' "$value_to_escape" | sed 's/\\/\\\\/g; s/"/\\"/g'
+          }
+
+          case "$AUTOMATION_SUITE_CREDENTIAL_KIND" in
+            username-password)
+              escaped_username=$(
+                dotenv_escape "$AUTOMATION_SUITE_USERNAME"
+              ) || exit $?
+              escaped_password=$(
+                dotenv_escape "$AUTOMATION_SUITE_PASSWORD"
+              ) || exit $?
+              {
+                printf 'AUTOMATION_SUITE_USERNAME="%s"\n' \
+                  "$escaped_username"
+                printf 'AUTOMATION_SUITE_PASSWORD="%s"\n' \
+                  "$escaped_password"
+              } > "$temporary_file"
+              ;;
+            secret-text)
+              escaped_secret=$(
+                dotenv_escape "$AUTOMATION_SUITE_SECRET"
+              ) || exit $?
+              printf 'AUTOMATION_SUITE_SECRET="%s"\n' \
+                "$escaped_secret" \
+                > "$temporary_file"
+              ;;
+            *)
+              echo 'Unsupported automation suite credential binding.' >&2
+              exit 64
+              ;;
+          esac
+
+          chmod 600 "$temporary_file"
+          mv -f -- "$temporary_file" "$env_file"
+          chmod 600 "$env_file"
+          trap - EXIT HUP INT TERM
+        '''.stripIndent())
+  }
+}
+
+def bindAutomationSuiteCredential(String credentialId) {
+  boolean usernamePasswordBindingEntered = false
+  try {
+    withCredentials([usernamePassword(
+        credentialsId: credentialId,
+        usernameVariable: 'AUTOMATION_SUITE_USERNAME',
+        passwordVariable: 'AUTOMATION_SUITE_PASSWORD'
+    )]) {
+      usernamePasswordBindingEntered = true
+      writeAutomationSuiteEnvironmentFile('username-password')
+    }
+    return 'username/password'
+  } catch (Exception bindingError) {
+    if (usernamePasswordBindingEntered) {
+      throw bindingError
+    }
+  }
+
+  withCredentials([string(
+      credentialsId: credentialId,
+      variable: 'AUTOMATION_SUITE_SECRET'
+  )]) {
+    writeAutomationSuiteEnvironmentFile('secret-text')
+  }
+  return 'secret text'
+}
+
 def configurationBooleanValue(String key, Object configuredValue) {
   String value = configuredValue?.toString()?.trim()?.toLowerCase()
   if (!value || value in ['false', '0', 'null', 'undefined']) {
@@ -186,6 +292,176 @@ def configurationBooleanValue(String key, Object configuredValue) {
 
 def emailImportanceValue(String key, Object configuredValue) {
   return configurationBooleanValue(key, configuredValue)
+}
+
+def normalizedArgoCdValue(Object configuredValue) {
+  String value = configuredValue?.toString()?.trim()
+  return !value || value.toLowerCase(java.util.Locale.ROOT) in ['null', 'undefined'] ? '' : value
+}
+
+def normalizedArgoCdStateFilePath(Object configuredValue) {
+  String path = normalizedArgoCdValue(configuredValue).replace('\\', '/')
+  if (!path) {
+    return ''
+  }
+  if (path.startsWith('/') ||
+      path ==~ /^[A-Za-z]:\/.*/ ||
+      path.split('/', -1).any { String segment -> !segment || segment in ['.', '..'] }) {
+    throw new IllegalArgumentException(
+        'ARGOCD_STATE_FILE_PATH must be a safe file path relative to the sync repository.')
+  }
+  return path
+}
+
+def normalizedArgoCdGateStatus(Object gateStatus, Object buildResult) {
+  String value = normalizedArgoCdValue(gateStatus).toUpperCase(java.util.Locale.ROOT)
+  Map<String, String> aliases = [
+    'SUCCESS': 'PASS',
+    'PASSED': 'PASS',
+    'FAILURE': 'FAIL',
+    'FAILED': 'FAIL',
+    'UNSTABLE': 'WARNING',
+    'ABORTED': 'CANCELLED'
+  ]
+  value = aliases.get(value) ?: value
+  if (value in ['PASS', 'FAIL', 'WARNING', 'CANCELLED', 'ERROR']) {
+    return value
+  }
+
+  String fallback = normalizedArgoCdValue(buildResult).toUpperCase(java.util.Locale.ROOT)
+  fallback = aliases.get(fallback) ?: fallback
+  return fallback in ['PASS', 'FAIL', 'WARNING', 'CANCELLED', 'ERROR']
+      ? fallback
+      : 'ERROR'
+}
+
+def argoCdGateResultStatus(Map gateResult, Object buildResult) {
+  if (gateResult?.passed == true) {
+    return 'PASS'
+  }
+  return normalizedArgoCdGateStatus(
+      normalizedArgoCdValue(buildResult).equalsIgnoreCase('UNSTABLE') ? 'WARNING' : 'FAIL',
+      buildResult)
+}
+
+def argoCdGateFailureStatus(Throwable failure) {
+  Throwable current = failure
+  int depth = 0
+  while (current != null && depth < 16) {
+    String type = current.getClass().getName()
+    if (type == 'org.jenkinsci.plugins.workflow.steps.FlowInterruptedException') {
+      return 'CANCELLED'
+    }
+    if (type ==
+        'io.jenkins.plugins.octanesuitegatebyembiti.services.GateFailedException') {
+      return 'FAIL'
+    }
+    current = current.getCause()
+    depth++
+  }
+  return 'ERROR'
+}
+
+def argoCdStateDocument(Object gateStatus, Object buildResult) {
+  return "gate_status: \"${normalizedArgoCdGateStatus(gateStatus, buildResult)}\"\n"
+}
+
+def argoCdUsernamePasswordBinding(String credentialId) {
+  return [
+    '$class': 'UsernamePasswordMultiBinding',
+    credentialsId: credentialId,
+    usernameVariable: 'ARGOCD_GIT_USERNAME',
+    passwordVariable: 'ARGOCD_GIT_PASSWORD'
+  ]
+}
+
+def updateArgoCdGitOpsState(
+    Map configuration, Object gateStatus, Object buildResult) {
+  String repoUrl = normalizedArgoCdValue(configuration.repoUrl)
+  String configuredStateFilePath = normalizedArgoCdValue(configuration.stateFilePath)
+  if (!repoUrl || !configuredStateFilePath) {
+    echo 'INFO: ArgoCD GitOps state sync bypassed. Repository variables are undefined.'
+    return false
+  }
+
+  try {
+    String branch = normalizedArgoCdValue(configuration.branch) ?: 'main'
+    String stateFilePath = normalizedArgoCdStateFilePath(configuredStateFilePath)
+    String credentialId = normalizedArgoCdValue(configuration.credentialId)
+    if (!credentialId) {
+      throw new IllegalArgumentException('ARGOCD_GIT_CREDENTIAL_ID is undefined.')
+    }
+    String status = normalizedArgoCdGateStatus(gateStatus, buildResult)
+
+    withCredentials([argoCdUsernamePasswordBinding(credentialId)]) {
+      dir('.octane-argocd-state-sync') {
+        deleteDir()
+        try {
+          withEnv([
+            "ARGOCD_SYNC_REPO_URL_VALUE=${repoUrl}",
+            "ARGOCD_SYNC_BRANCH_VALUE=${branch}",
+            "ARGOCD_STATE_FILE_PATH_VALUE=${stateFilePath}",
+            "ARGOCD_GATE_STATUS_VALUE=${status}"
+          ]) {
+            sh(
+                label: 'Publish Octane gate status for ArgoCD',
+                script: '''#!/bin/sh
+                  set +x
+                  set -eu
+                  umask 077
+
+                  git check-ref-format --branch "$ARGOCD_SYNC_BRANCH_VALUE" >/dev/null
+
+                  askpass_file=$(mktemp "${TMPDIR:-/tmp}/octane-git-askpass.XXXXXX")
+                  trap 'rm -f -- "$askpass_file"' EXIT HUP INT TERM
+                  {
+                    printf '%s\n' '#!/bin/sh'
+                    printf '%s\n' 'case "$1" in'
+                    printf '%s\n' '  *Username*) printf '"'"'%s\\n'"'"' "$ARGOCD_GIT_USERNAME" ;;'
+                    printf '%s\n' '  *) printf '"'"'%s\\n'"'"' "$ARGOCD_GIT_PASSWORD" ;;'
+                    printf '%s\n' 'esac'
+                  } > "$askpass_file"
+                  chmod 700 "$askpass_file"
+                  export GIT_ASKPASS="$askpass_file"
+                  export GIT_TERMINAL_PROMPT=0
+
+                  git -c credential.helper= clone --quiet --single-branch \
+                    --branch "$ARGOCD_SYNC_BRANCH_VALUE" \
+                    -- "$ARGOCD_SYNC_REPO_URL_VALUE" .
+
+                  state_file=$ARGOCD_STATE_FILE_PATH_VALUE
+                  state_directory=$(dirname -- "$state_file")
+                  mkdir -p -- "$state_directory"
+                  if [ -L "$state_file" ]; then
+                    echo 'Refusing to replace a symbolic-link ArgoCD state file.' >&2
+                    exit 64
+                  fi
+                  printf 'gate_status: "%s"\n' "$ARGOCD_GATE_STATUS_VALUE" > "$state_file"
+
+                  if [ -z "$(git status --porcelain --untracked-files=all -- "$state_file")" ]; then
+                    exit 0
+                  fi
+
+                  git add -- "$state_file"
+                  git -c user.name='Jenkins Octane Gate' \
+                    -c user.email='jenkins-octane-gate@localhost' \
+                    commit --quiet \
+                    -m "Update Octane gate status to $ARGOCD_GATE_STATUS_VALUE"
+                  git -c credential.helper= push --quiet origin \
+                    "HEAD:$ARGOCD_SYNC_BRANCH_VALUE"
+                '''.stripIndent())
+          }
+        } finally {
+          deleteDir()
+        }
+      }
+    }
+    echo "INFO: ArgoCD GitOps state synchronized with status ${status}."
+    return true
+  } catch (Exception ignored) {
+    echo 'WARN: ArgoCD state sync failed. Invalid Git credentials or repository access denied.'
+    return false
+  }
 }
 
 pipeline {
@@ -251,10 +527,17 @@ pipeline {
             }
             env.setProperty(key, selectedValue == null ? '' : selectedValue.toString())
           }
+          env.AUTOMATION_SUITE_CREDENTIAL_ID =
+              normalizeAutomationSuiteCredentialId(
+                  env.AUTOMATION_SUITE_CREDENTIAL_ID)
+          String automationTestSourceDirectory =
+              env.getProperty('OCTANE_TEST_SOURCE_DIR')?.toString()?.trim() ?: pwd()
+          env.AUTOMATION_SUITE_ENV_FILE = "${automationTestSourceDirectory}/.env"
           [
             'OCTANE_INTERVAL_EMAIL_IS_IMPORTANT',
             'OCTANE_FINAL_EMAIL_IS_IMPORTANT',
             'PRINT_PROJECT_SUMMARY_ON_INTERVAL_EMAILS',
+            'PRINT_TESTERS_ON_EMAIL_BODY',
             'PRINT_DEFECTS_ON_EMAIL_BODY'
           ].each {
             String key ->
@@ -325,6 +608,38 @@ pipeline {
       }
     }
 
+    stage('Build') {
+      steps {
+        echo 'Build or deploy your testable artifact here.'
+      }
+    }
+
+    stage('Prepare Suite Credentials') {
+      steps {
+        script {
+          sh(
+              label: 'Remove stale automation suite environment',
+              script: '''#!/bin/sh
+                set +x
+                rm -f -- "$AUTOMATION_SUITE_ENV_FILE"
+              '''.stripIndent())
+          if (env.AUTOMATION_SUITE_CREDENTIAL_ID) {
+            String credentialKind =
+                bindAutomationSuiteCredential(env.AUTOMATION_SUITE_CREDENTIAL_ID)
+            echo "Generated secure ${credentialKind} .env file at ${env.AUTOMATION_SUITE_ENV_FILE}"
+          } else {
+            echo 'No automation suite credential configured; skipping secure .env generation.'
+          }
+        }
+      }
+    }
+
+    stage('Run Tests') {
+      steps {
+        echo 'Trigger the system that creates or updates the ALM Octane suite run here.'
+      }
+    }
+
     stage('Wait For Octane Suite') {
       steps {
         script {
@@ -357,6 +672,7 @@ pipeline {
           int pollIntervalSeconds = wholeNumber('OCTANE_POLL_INTERVAL_SECONDS', 1)
           int basePassrateFigure = wholeNumber('OCTANE_BASE_PASSRATE_FIGURE', 0)
           int baseExecutionFigure = wholeNumber('OCTANE_BASE_EXECUTION_FIGURE', 0)
+          int limitForMetricRunsInSuite = wholeNumber('LIMIT_FOR_METRIC_RUNS_IN_SUITE', 1)
           int riskHeatMapMaxDefects = wholeNumber('OCTANE_RISK_HEAT_MAP_MAX_DEFECTS', 1)
           int emailViewportWidth = wholeNumber('OCTANE_EMAIL_VIEWPORT_WIDTH', 320)
           int emailDefectLimit = wholeNumber('PRINT_DEFECTS_ON_EMAIL_BODY_LIMIT', 0, true)
@@ -365,12 +681,14 @@ pipeline {
           boolean printDefectGroups = booleanValue('OCTANE_EMAIL_PRINT_DEFECT_GROUPS')
           boolean printProjectSummaryOnIntervalEmails =
               booleanValue('PRINT_PROJECT_SUMMARY_ON_INTERVAL_EMAILS')
+          boolean printTestersOnEmailBody = booleanValue('PRINT_TESTERS_ON_EMAIL_BODY')
           boolean printDefectsOnEmailBody = booleanValue('PRINT_DEFECTS_ON_EMAIL_BODY')
           boolean progressArchiveScreenshot =
               booleanValue('OCTANE_PROGRESS_EMAIL_ARCHIVE_SCREENSHOT')
           booleanValue('OCTANE_FINAL_EMAIL_ARCHIVE_SCREENSHOT')
 
           env.OCTANE_GATE_PASSED = 'false'
+          env.ARGOCD_GATE_STATUS = 'ERROR'
           octaneCronProgressEmail(
               cron: env.PROGRESS_EMAIL_INTERVAL_CRONJOB,
               to: env.OCTANE_EMAIL_TO,
@@ -380,12 +698,10 @@ pipeline {
               domainName: env.OCTANE_DOMAIN_NAME,
               from: env.OCTANE_EMAIL_FROM,
               replyTo: env.OCTANE_EMAIL_REPLY_TO,
-              subject:
-                  "(automated) QE OCTANE GATE PROGRESS REPORT | Job #${env.BUILD_NUMBER} | {{EAT_DATE}} | ${env.OCTANE_PROJECT_NAME} "
-                      + '({{REMAINING_TIME}})',
+              subject: "(automated) QE OCTANE GATE PROGRESS REPORT | Job #${env.BUILD_NUMBER} ({{REMAINING_TIME}}) | {{EAT_DATE}} | ${env.OCTANE_PROJECT_NAME}",
               body: '''Hello Team,
 
-The automated job for {{PROJECT_NAME}} tests is {{GATE_RESULT}}, with {{REMAINING_TIME}}; the latest Octane update was {{UPDATED_AT_TEXT}}.
+The automated job for {{PROJECT_NAME}} tests is **{{GATE_RESULT}}**, with an execution rate of **{{EXECUTIONRATE}}**, a pass rate of **{{PASSRATE}}**, and {{TIME_REMAINING}} remaining; the latest Octane update was {{LAST_UPDATE}}.
 
 Set criteria: {{CRITERIA}}
 
@@ -397,12 +713,13 @@ See below the execution details:
 
 {{REPORT_SCREENSHOT}}
 
-Thanks.
+Best,
 QA Automation Team''',
               onFailure: env.OCTANE_PROGRESS_EMAIL_ON_FAILURE,
               printDefectGroups: printDefectGroups,
               projectSummary: env.PROJECT_SUMMARY,
               printProjectSummaryOnIntervalEmails: printProjectSummaryOnIntervalEmails,
+              printTestersOnEmailBody: printTestersOnEmailBody,
               printDefectsOnEmailBody: printDefectsOnEmailBody,
               printDefectsOnEmailBodyFilter: env.PRINT_DEFECTS_ON_EMAIL_BODY_FILTER,
               printDefectsOnEmailBodyLimit: emailDefectLimit,
@@ -427,8 +744,10 @@ QA Automation Team''',
                       + (suiteRunSource ? suiteRunSource : '<none; evaluation skipped>'))
               echo "Octane critical suite run selection: ${criticalSuiteRunSource}"
 
-              Map gateResult =
-                  octaneSuiteGate(
+              Map gateResult
+              try {
+                gateResult =
+                    octaneSuiteGate(
                       serverId: env.OCTANE_SERVER_ID,
                       baseUrl: env.OCTANE_BASE_URL,
                       credentialsId: env.OCTANE_API_CREDENTIAL_ID,
@@ -457,12 +776,19 @@ QA Automation Team''',
                       timeoutMinutesExtended: timeoutMinutesExtended,
                       basePassrateFigure: basePassrateFigure,
                       baseExecutionFigure: baseExecutionFigure,
+                      limitForMetricRunsInSuite: limitForMetricRunsInSuite,
                       markUnstable: markUnstable,
                       riskHeatMap: riskHeatMap,
                       riskHeatMapDefectQuery: env.OCTANE_RISK_HEAT_MAP_DEFECT_QUERY,
                       riskHeatMapMaxDefects: riskHeatMapMaxDefects)
+              } catch (Exception gateFailure) {
+                env.ARGOCD_GATE_STATUS = argoCdGateFailureStatus(gateFailure)
+                throw gateFailure
+              }
 
               env.OCTANE_GATE_PASSED = gateResult.passed == true ? 'true' : 'false'
+              env.ARGOCD_GATE_STATUS =
+                  argoCdGateResultStatus(gateResult, currentBuild.currentResult)
               echo "Octane criteria verdict: ${gateResult.passed ? 'PASS' : 'FAIL'}"
               echo "Octane suite run IDs: ${gateResult.suiteRunIds.join(', ')}"
               if (gateResult.regressionEvaluationEnabled) {
@@ -483,6 +809,22 @@ QA Automation Team''',
       }
     }
 
+    stage('Update ArgoCD GitOps State') {
+      steps {
+        script {
+          updateArgoCdGitOpsState(
+              [
+                repoUrl: env.ARGOCD_SYNC_REPO_URL,
+                branch: env.ARGOCD_SYNC_BRANCH,
+                stateFilePath: env.ARGOCD_STATE_FILE_PATH,
+                credentialId: env.ARGOCD_GIT_CREDENTIAL_ID
+              ],
+              env.ARGOCD_GATE_STATUS,
+              currentBuild.currentResult)
+        }
+      }
+    }
+
     stage('Email Octane Report') {
       steps {
         octaneEmailReport(
@@ -493,12 +835,10 @@ QA Automation Team''',
             domainName: env.OCTANE_DOMAIN_NAME,
             from: env.OCTANE_EMAIL_FROM,
             replyTo: env.OCTANE_EMAIL_REPLY_TO,
-            subject:
-                "(automated) QE OCTANE GATE REPORT Job #${env.BUILD_NUMBER} "
-                    + "Time {{DURATION}} | {{EAT_DATE}} | ${env.OCTANE_PROJECT_NAME}",
+            subject: "(automated) QE OCTANE GATE REPORT | Job #${env.BUILD_NUMBER} (Duration: {{DURATION}}) | {{EAT_DATE}} | ${env.OCTANE_PROJECT_NAME}",
             body: '''Hello Team,
 
-The automated job for {{PROJECT_NAME}} tests has run for {{DURATION}} and is {{GATE_RESULT}}.
+The automated job for the {{PROJECT_NAME}} tests ran for {{DURATION}}, achieved an execution rate of **{{EXECUTIONRATE}}** and a pass rate of **{{PASSRATE}}**, and the gate status is **{{GATE_RESULT}}**.
 
 Set criteria: {{CRITERIA}}
 
@@ -510,13 +850,14 @@ See below the execution details:
 
 {{REPORT_SCREENSHOT}}
 
-Thanks.
+Best,
 QA Automation Team''',
             onFailure: env.OCTANE_FINAL_EMAIL_ON_FAILURE,
             printDefectGroups: env.OCTANE_EMAIL_PRINT_DEFECT_GROUPS.toBoolean(),
             projectSummary: env.PROJECT_SUMMARY,
             printProjectSummaryOnIntervalEmails:
                 env.PRINT_PROJECT_SUMMARY_ON_INTERVAL_EMAILS.toBoolean(),
+            printTestersOnEmailBody: env.PRINT_TESTERS_ON_EMAIL_BODY.toBoolean(),
             printDefectsOnEmailBody: env.PRINT_DEFECTS_ON_EMAIL_BODY.toBoolean(),
             printDefectsOnEmailBodyFilter: env.PRINT_DEFECTS_ON_EMAIL_BODY_FILTER,
             printDefectsOnEmailBodyLimit: env.PRINT_DEFECTS_ON_EMAIL_BODY_LIMIT.toInteger(),
@@ -526,6 +867,34 @@ QA Automation Team''',
             archiveScreenshot: env.OCTANE_FINAL_EMAIL_ARCHIVE_SCREENSHOT.toBoolean(),
             important: env.OCTANE_FINAL_EMAIL_IS_IMPORTANT.toBoolean())
       }
+    }
+
+    stage('Deploy') {
+      when {
+        expression { env.OCTANE_GATE_PASSED == 'true' }
+      }
+      steps {
+        echo 'Continue with the next stage once the Octane gate passes.'
+      }
+    }
+  }
+
+  post {
+    always {
+      echo 'Executing secret cleanup...'
+      sh(
+          label: 'Remove automation suite environment',
+          script: '''#!/bin/sh
+            set +x
+            if [ -n "${AUTOMATION_SUITE_ENV_FILE:-}" ]; then
+              env_file=$AUTOMATION_SUITE_ENV_FILE
+            elif [ -n "${OCTANE_TEST_SOURCE_DIR:-}" ]; then
+              env_file=$OCTANE_TEST_SOURCE_DIR/.env
+            else
+              env_file=$WORKSPACE/.env
+            fi
+            rm -f -- "$env_file"
+          '''.stripIndent())
     }
   }
 }
