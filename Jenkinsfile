@@ -507,18 +507,6 @@ pipeline {
       }
     }
 
-    stage('Build') {
-      steps {
-        echo 'Build or deploy your testable artifact here.'
-      }
-    }
-
-    stage('Run Tests') {
-      steps {
-        echo 'Trigger the system that creates or updates the ALM Octane suite run here.'
-      }
-    }
-
     stage('Wait For Octane Suite') {
       steps {
         script {
