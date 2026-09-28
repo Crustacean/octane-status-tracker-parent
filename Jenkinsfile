@@ -1,0 +1,531 @@
+def selectConfigurationValue(
+    String key, Map jobParameters, Map yamlConfiguration, Map configurationDefaults) {
+  if (yamlConfiguration.containsKey(key)) {
+    return yamlConfiguration.get(key)
+  }
+  if (jobParameters.containsKey(key)) {
+    return jobParameters.get(key)
+  }
+  return configurationDefaults.get(key)
+}
+
+def pipelineConfigurationDefaults() {
+  return [
+    'OCTANE_SPACES_MAPPING_FILE': 'octane_spaces_mapping.json',
+    'OCTANE_SHARED_SPACE_NAME': '',
+    'OCTANE_WORKSPACE_NAME': '',
+    'OCTANE_REGRESSION_SUITE_RUN_ID': '',
+    'OCTANE_CRITICAL_SUITE_RUN_ID': '',
+    'OCTANE_DEFINED_SCOPE': '',
+    'OCTANE_CRITICAL_SCOPE_NAME': 'critical',
+    'OCTANE_CRITICAL_GRAPHS_TITLE': '',
+    'OCTANE_REGRESSION_GRAPHS_TITLE': '',
+    'OCTANE_PROJECT_NAME': 'Octane Project',
+    'OCTANE_DOMAIN_NAME': 'Octane Domain',
+    'AUTOMATED_TESTING_TARGET': '100',
+    'BROWSERPATH': '',
+    'OCTANE_TIMEOUT_MINUTES': '120',
+    'OCTANE_TIMEOUT_MINUTES_EXTENDED': '0',
+    'OCTANE_POLL_INTERVAL_SECONDS': '1',
+    'OCTANE_BASE_PASSRATE_FIGURE': '95',
+    'OCTANE_BASE_EXECUTION_FIGURE': '100',
+    'OCTANE_MARK_UNSTABLE': 'false',
+    'OCTANE_CRITERIA': '''
+      (regressions.executionRate == 100 AND regressions.passRate >= 95)
+      AND (critical.executionRate == 100 AND critical.passRate == 100)
+      AND (defects.major < 10% AND defects.minor < 20%)
+      AND (defects.Unspecified == 0%)
+    ''',
+    'OCTANE_MAJOR_DEFECT_GROUP_NAME': 'major',
+    'OCTANE_MAJOR_DEFECT_TYPES': 'Critical, Very High, High, Unspecified',
+    'OCTANE_MINOR_DEFECT_GROUP_NAME': 'minor',
+    'OCTANE_MINOR_DEFECT_TYPES': 'Low, Medium',
+    'OCTANE_RISK_HEAT_MAP': 'true',
+    'OCTANE_RISK_HEAT_MAP_DEFECT_QUERY': '',
+    'OCTANE_RISK_HEAT_MAP_MAX_DEFECTS': '1000',
+    'PROGRESS_EMAIL_INTERVAL_CRONJOB': '',
+    'PROGRESS_EMAIL_INTERVAL_TIMEOUT': 'false',
+    'PROGRESS_EMAIL_STALENESS_THRESHOLD_MINUTES': '1',
+    'OCTANE_EMAIL_TO': '',
+    'OCTANE_EMAIL_CC': '',
+    'OCTANE_EMAIL_BCC': '',
+    'OCTANE_EMAIL_FROM': 'jenkins-notifications@example.com',
+    'OCTANE_EMAIL_REPLY_TO': 'qa-team@example.com',
+    'OCTANE_EMAIL_PRINT_DEFECT_GROUPS': 'true',
+    'PROJECT_SUMMARY': '',
+    'PRINT_PROJECT_SUMMARY_ON_INTERVAL_EMAILS': 'false',
+    'PRINT_DEFECTS_ON_EMAIL_BODY': 'false',
+    'PRINT_DEFECTS_ON_EMAIL_BODY_FILTER': '',
+    'PRINT_DEFECTS_ON_EMAIL_BODY_LIMIT': '100',
+    'OCTANE_EMAIL_THEME': 'DARK',
+    'OCTANE_EMAIL_VIEWPORT_WIDTH': '1400',
+    'OCTANE_PROGRESS_EMAIL_ON_FAILURE': 'WARN',
+    'OCTANE_PROGRESS_EMAIL_ARCHIVE_SCREENSHOT': 'false',
+    'OCTANE_INTERVAL_EMAIL_IS_IMPORTANT': 'false',
+    'OCTANE_FINAL_EMAIL_ON_FAILURE': 'UNSTABLE',
+    'OCTANE_FINAL_EMAIL_ARCHIVE_SCREENSHOT': 'true',
+    'OCTANE_FINAL_EMAIL_IS_IMPORTANT': 'false'
+  ]
+}
+
+def resolvePipelineSourcePath(String path, environment) {
+  String requestedPath = path?.trim()
+  if (!requestedPath) {
+    return requestedPath
+  }
+  boolean absolutePath =
+      requestedPath.startsWith('/') || requestedPath ==~ /^[A-Za-z]:[\\\/].*/
+  String sourceDirectory =
+      environment.getProperty('OCTANE_PIPELINE_SOURCE_DIR')?.toString()?.trim()
+  return sourceDirectory && !absolutePath
+      ? "${sourceDirectory}/${requestedPath}".toString()
+      : requestedPath
+}
+
+def bootstrappedConfigurationJson(environment) {
+  return environment.getProperty('OCTANE_BOOTSTRAP_CONFIGURATION_JSON')?.toString()?.trim()
+}
+
+def resolveOctaneConnection(
+    Map mapping, Object sharedSpaceValue, Object workspaceValue, String mappingPath) {
+  if (!(mapping.shared_spaces instanceof Collection)) {
+    throw new IllegalArgumentException(
+        "Octane spaces mapping file must contain a shared_spaces array: ${mappingPath}")
+  }
+
+  String sharedSpaceSelector = sharedSpaceValue?.toString()?.trim()
+  String workspaceSelector = workspaceValue?.toString()?.trim()
+  boolean sharedSpaceSelectorIsId = sharedSpaceSelector ==~ /[0-9]{1,18}/
+  boolean workspaceSelectorIsId = workspaceSelector ==~ /[0-9]{1,18}/
+  String normalizedSharedSpaceName = sharedSpaceSelector?.toLowerCase(java.util.Locale.ROOT)
+  String normalizedWorkspaceName = workspaceSelector?.toLowerCase(java.util.Locale.ROOT)
+  def selectedSharedSpace =
+      mapping.shared_spaces.find { space ->
+        if (!(space instanceof Map)) {
+          return false
+        }
+        return sharedSpaceSelectorIsId
+            ? space.sharedSpaceId?.toString()?.trim() == sharedSpaceSelector
+            : space.sharedSpaceName?.toString()?.trim()?.toLowerCase(java.util.Locale.ROOT) ==
+                normalizedSharedSpaceName
+      }
+  if (!(selectedSharedSpace instanceof Map)) {
+    throw new IllegalArgumentException(
+        "OCTANE_SHARED_SPACE_NAME '${sharedSpaceSelector}' did not match a name or ID in "
+            + mappingPath)
+  }
+  if (!(selectedSharedSpace.workspaces instanceof Collection)) {
+    throw new IllegalArgumentException(
+        "Shared space '${sharedSpaceSelector}' has no workspaces array in ${mappingPath}")
+  }
+
+  def selectedWorkspace =
+      selectedSharedSpace.workspaces.find { workspace ->
+        if (!(workspace instanceof Map)) {
+          return false
+        }
+        return workspaceSelectorIsId
+            ? workspace.workspaceId?.toString()?.trim() == workspaceSelector
+            : workspace.workspaceName?.toString()?.trim()?.toLowerCase(java.util.Locale.ROOT) ==
+                normalizedWorkspaceName
+      }
+  if (!(selectedWorkspace instanceof Map)) {
+    throw new IllegalArgumentException(
+        "OCTANE_WORKSPACE_NAME '${workspaceSelector}' did not match a name or ID under "
+            + "shared space '${sharedSpaceSelector}' in ${mappingPath}")
+  }
+
+  String sharedSpaceId = selectedSharedSpace.sharedSpaceId?.toString()?.trim()
+  String workspaceId = selectedWorkspace.workspaceId?.toString()?.trim()
+  String sharedSpaceName = selectedSharedSpace.sharedSpaceName?.toString()?.trim()
+  String workspaceName = selectedWorkspace.workspaceName?.toString()?.trim()
+  if (!(sharedSpaceId ==~ /[0-9]{1,18}/) ||
+      !(workspaceId ==~ /[0-9]{1,18}/) ||
+      !sharedSpaceName ||
+      !workspaceName) {
+    throw new IllegalArgumentException(
+        "Shared space '${sharedSpaceSelector}' and workspace '${workspaceSelector}' must "
+            + "define names and numeric IDs in ${mappingPath}.")
+  }
+
+  String baseUrl =
+      selectedSharedSpace.specific_url?.toString()?.trim() ?:
+          mapping.shared_url?.toString()?.trim()
+  if (!baseUrl) {
+    throw new IllegalArgumentException(
+        "Base URL missing for space: ${sharedSpaceName} in octane_spaces_mapping.json")
+  }
+  String derivedIdentifier =
+      sharedSpaceName.toLowerCase(java.util.Locale.ROOT).replaceAll(/\s+/, '_')
+  String credentialsId =
+      selectedSharedSpace.apiCredentialId?.toString()?.trim() ?: derivedIdentifier
+  String serverId = selectedSharedSpace.serverId?.toString()?.trim() ?: derivedIdentifier
+
+  return [
+    baseUrl: baseUrl,
+    credentialsId: credentialsId,
+    insecureTransport: baseUrl.toLowerCase(java.util.Locale.ROOT).startsWith('http://'),
+    serverId: serverId,
+    sharedSpaceId: sharedSpaceId,
+    sharedSpaceName: sharedSpaceName,
+    workspaceId: workspaceId,
+    workspaceName: workspaceName
+  ]
+}
+
+def configurationBooleanValue(String key, Object configuredValue) {
+  String value = configuredValue?.toString()?.trim()?.toLowerCase()
+  if (!value || value in ['false', '0', 'null', 'undefined']) {
+    return false
+  }
+  if (value in ['true', '1']) {
+    return true
+  }
+  throw new IllegalArgumentException("${key} must be true, false, 1, or 0.")
+}
+
+def emailImportanceValue(String key, Object configuredValue) {
+  return configurationBooleanValue(key, configuredValue)
+}
+
+pipeline {
+  agent any
+
+  environment {
+    // Runtime values are applied after this Declarative environment scope is created.
+    PARAMS_FILE = 'variables.yaml'
+  }
+
+  stages {
+    stage('Load Configuration') {
+      steps {
+        script {
+          Map configurationDefaults = pipelineConfigurationDefaults()
+          List<String> configurationKeys =
+              configurationDefaults.keySet().collect { Object key -> key.toString() }
+          String transportedConfigurationJson = bootstrappedConfigurationJson(env)
+          Map yamlConfiguration
+          String configurationSource
+          if (transportedConfigurationJson) {
+            def transportedConfiguration = readJSON(text: transportedConfigurationJson)
+            if (!(transportedConfiguration instanceof Map)) {
+              error 'Transported Octane configuration must contain a top-level map.'
+            }
+            yamlConfiguration = transportedConfiguration as Map
+            configurationSource = 'validated variables.yaml from the dir2 bootstrap'
+          } else {
+            boolean parameterFileProvided =
+                params.containsKey('PARAMS_FILE') &&
+                params.PARAMS_FILE != null &&
+                params.PARAMS_FILE.toString().trim()
+            String paramsFile =
+                parameterFileProvided
+                    ? params.PARAMS_FILE.toString().trim()
+                    : env.PARAMS_FILE.trim()
+            paramsFile = resolvePipelineSourcePath(paramsFile, env)
+            if (!fileExists(paramsFile)) {
+              error "Octane configuration file was not found in the workspace: ${paramsFile}"
+            }
+
+            def loadedConfiguration = readYaml(file: paramsFile)
+            if (!(loadedConfiguration instanceof Map)) {
+              error "Octane configuration file must contain a top-level YAML map: ${paramsFile}"
+            }
+            yamlConfiguration = loadedConfiguration as Map
+            configurationSource = paramsFile
+          }
+          List<String> unknownKeys =
+              yamlConfiguration.keySet()
+                  .collect { it.toString() }
+                  .findAll { !configurationKeys.contains(it) }
+                  .sort()
+          if (!unknownKeys.isEmpty()) {
+            error "Unsupported Octane configuration key(s): ${unknownKeys.join(', ')}"
+          }
+
+          configurationKeys.each { String key ->
+            def selectedValue =
+                selectConfigurationValue(key, params, yamlConfiguration, configurationDefaults)
+            if (selectedValue instanceof Map || selectedValue instanceof Collection) {
+              error "Octane configuration value ${key} must be a scalar."
+            }
+            env.setProperty(key, selectedValue == null ? '' : selectedValue.toString())
+          }
+          [
+            'OCTANE_INTERVAL_EMAIL_IS_IMPORTANT',
+            'OCTANE_FINAL_EMAIL_IS_IMPORTANT',
+            'PRINT_PROJECT_SUMMARY_ON_INTERVAL_EMAILS',
+            'PRINT_DEFECTS_ON_EMAIL_BODY'
+          ].each {
+            String key ->
+              try {
+                env.setProperty(
+                    key,
+                    configurationBooleanValue(key, env.getProperty(key)).toString())
+              } catch (IllegalArgumentException exception) {
+                error exception.message
+              }
+          }
+
+          List<String> requiredKeys = [
+            'OCTANE_SHARED_SPACE_NAME',
+            'OCTANE_WORKSPACE_NAME',
+            'OCTANE_CRITICAL_SUITE_RUN_ID',
+            'OCTANE_CRITERIA'
+          ]
+          List<String> missingKeys =
+              requiredKeys.findAll { String key ->
+                String value = env.getProperty(key)?.toString()?.trim()
+                return !value
+              }
+          if (!missingKeys.isEmpty()) {
+            error "Required Octane configuration is blank: ${missingKeys.join(', ')}"
+          }
+
+          String spacesMappingFile =
+              resolvePipelineSourcePath(env.OCTANE_SPACES_MAPPING_FILE, env)
+          if (!spacesMappingFile || !fileExists(spacesMappingFile)) {
+            error "Octane spaces mapping file was not found in the workspace: ${spacesMappingFile}"
+          }
+          def loadedSpacesMapping = readJSON(file: spacesMappingFile)
+          if (!(loadedSpacesMapping instanceof Map)) {
+            error "Octane spaces mapping file must contain a JSON object: ${spacesMappingFile}"
+          }
+          Map octaneConnection
+          try {
+            octaneConnection =
+                resolveOctaneConnection(
+                    loadedSpacesMapping as Map,
+                    env.OCTANE_SHARED_SPACE_NAME,
+                    env.OCTANE_WORKSPACE_NAME,
+                    spacesMappingFile)
+          } catch (IllegalArgumentException exception) {
+            error exception.message
+          }
+          env.OCTANE_SERVER_ID = octaneConnection.serverId
+          env.OCTANE_BASE_URL = octaneConnection.baseUrl
+          env.OCTANE_API_CREDENTIAL_ID = octaneConnection.credentialsId
+          env.OCTANE_SHARED_SPACE_ID = octaneConnection.sharedSpaceId
+          env.OCTANE_WORKSPACE_ID = octaneConnection.workspaceId
+
+          echo "Loaded Octane configuration from ${configurationSource}."
+          if (octaneConnection.insecureTransport) {
+            echo 'Applied URL is insecure. Move to HTTPS for better security.'
+          }
+          echo(
+              "Resolved shared space '${env.OCTANE_SHARED_SPACE_NAME}' to "
+                  + "'${octaneConnection.sharedSpaceName}' (${env.OCTANE_SHARED_SPACE_ID}) and "
+                  + "workspace '${env.OCTANE_WORKSPACE_NAME}' to "
+                  + "'${octaneConnection.workspaceName}' (${env.OCTANE_WORKSPACE_ID}) from "
+                  + "${spacesMappingFile}; using Octane server '${env.OCTANE_SERVER_ID}'.")
+          echo(
+              'Configuration priority: YAML values, Jenkins Job UI parameters, '
+                  + 'then Jenkinsfile defaults.')
+        }
+      }
+    }
+
+    stage('Wait For Octane Suite') {
+      steps {
+        script {
+          def wholeNumber = { String key, int minimum, boolean blankAsZero = false ->
+            String value = env.getProperty(key)?.toString()?.trim()
+            if (!value && blankAsZero) {
+              return 0
+            }
+            try {
+              int parsed = Integer.parseInt(value)
+              if (parsed < minimum) {
+                error "${key} must be ${minimum} or greater."
+              }
+              return parsed
+            } catch (NumberFormatException ignored) {
+              error "${key} must be a whole number."
+            }
+          }
+          def booleanValue = { String key ->
+            try {
+              return configurationBooleanValue(key, env.getProperty(key))
+            } catch (IllegalArgumentException exception) {
+              error exception.message
+            }
+          }
+
+          int timeoutMinutes = wholeNumber('OCTANE_TIMEOUT_MINUTES', 1)
+          int timeoutMinutesExtended =
+              wholeNumber('OCTANE_TIMEOUT_MINUTES_EXTENDED', 0, true)
+          int pollIntervalSeconds = wholeNumber('OCTANE_POLL_INTERVAL_SECONDS', 1)
+          int basePassrateFigure = wholeNumber('OCTANE_BASE_PASSRATE_FIGURE', 0)
+          int baseExecutionFigure = wholeNumber('OCTANE_BASE_EXECUTION_FIGURE', 0)
+          int riskHeatMapMaxDefects = wholeNumber('OCTANE_RISK_HEAT_MAP_MAX_DEFECTS', 1)
+          int emailViewportWidth = wholeNumber('OCTANE_EMAIL_VIEWPORT_WIDTH', 320)
+          int emailDefectLimit = wholeNumber('PRINT_DEFECTS_ON_EMAIL_BODY_LIMIT', 0, true)
+          boolean markUnstable = booleanValue('OCTANE_MARK_UNSTABLE')
+          boolean riskHeatMap = booleanValue('OCTANE_RISK_HEAT_MAP')
+          boolean printDefectGroups = booleanValue('OCTANE_EMAIL_PRINT_DEFECT_GROUPS')
+          boolean printProjectSummaryOnIntervalEmails =
+              booleanValue('PRINT_PROJECT_SUMMARY_ON_INTERVAL_EMAILS')
+          boolean printDefectsOnEmailBody = booleanValue('PRINT_DEFECTS_ON_EMAIL_BODY')
+          boolean progressArchiveScreenshot =
+              booleanValue('OCTANE_PROGRESS_EMAIL_ARCHIVE_SCREENSHOT')
+          booleanValue('OCTANE_FINAL_EMAIL_ARCHIVE_SCREENSHOT')
+
+          env.OCTANE_GATE_PASSED = 'false'
+          octaneCronProgressEmail(
+              cron: env.PROGRESS_EMAIL_INTERVAL_CRONJOB,
+              to: env.OCTANE_EMAIL_TO,
+              cc: env.OCTANE_EMAIL_CC,
+              bcc: env.OCTANE_EMAIL_BCC,
+              projectName: env.OCTANE_PROJECT_NAME,
+              domainName: env.OCTANE_DOMAIN_NAME,
+              from: env.OCTANE_EMAIL_FROM,
+              replyTo: env.OCTANE_EMAIL_REPLY_TO,
+              subject:
+                  "(automated) QE OCTANE GATE PROGRESS REPORT | Job #${env.BUILD_NUMBER} | {{EAT_DATE}} | ${env.OCTANE_PROJECT_NAME} "
+                      + '({{REMAINING_TIME}})',
+              body: '''Hello Team,
+
+The automated job for {{PROJECT_NAME}} tests is {{GATE_RESULT}}, with {{REMAINING_TIME}}; the latest Octane update was {{UPDATED_AT_TEXT}}.
+
+Set criteria: {{CRITERIA}}
+
+Click here to {{REPORT_LINK}}.
+
+See below the execution details:
+
+{{EXECUTION_DETAILS}}
+
+{{REPORT_SCREENSHOT}}
+
+Thanks.
+QA Automation Team''',
+              onFailure: env.OCTANE_PROGRESS_EMAIL_ON_FAILURE,
+              printDefectGroups: printDefectGroups,
+              projectSummary: env.PROJECT_SUMMARY,
+              printProjectSummaryOnIntervalEmails: printProjectSummaryOnIntervalEmails,
+              printDefectsOnEmailBody: printDefectsOnEmailBody,
+              printDefectsOnEmailBodyFilter: env.PRINT_DEFECTS_ON_EMAIL_BODY_FILTER,
+              printDefectsOnEmailBodyLimit: emailDefectLimit,
+              theme: env.OCTANE_EMAIL_THEME,
+              browserPath: env.BROWSERPATH,
+              viewportWidth: emailViewportWidth,
+              archiveScreenshot: progressArchiveScreenshot,
+              important: env.OCTANE_INTERVAL_EMAIL_IS_IMPORTANT.toBoolean()) {
+            catchError(
+                buildResult: 'FAILURE',
+                catchInterruptions: false,
+                stageResult: 'FAILURE') {
+              // Each source accepts numeric IDs, "Release Name", or "Release Name, Sprint Name".
+              def suiteRunSource = (env.OCTANE_REGRESSION_SUITE_RUN_ID ?: '').trim()
+              def criticalSuiteRunSource = (env.OCTANE_CRITICAL_SUITE_RUN_ID ?: '').trim()
+              if (!criticalSuiteRunSource) {
+                error 'OCTANE_CRITICAL_SUITE_RUN_ID must contain a suite run selection.'
+              }
+
+              echo(
+                  'Octane regression suite run selection: '
+                      + (suiteRunSource ? suiteRunSource : '<none; evaluation skipped>'))
+              echo "Octane critical suite run selection: ${criticalSuiteRunSource}"
+
+              Map gateResult =
+                  octaneSuiteGate(
+                      serverId: env.OCTANE_SERVER_ID,
+                      baseUrl: env.OCTANE_BASE_URL,
+                      credentialsId: env.OCTANE_API_CREDENTIAL_ID,
+                      sharedSpaceId: env.OCTANE_SHARED_SPACE_ID,
+                      workspaceId: env.OCTANE_WORKSPACE_ID,
+                      suiteRunId: suiteRunSource,
+                      // Defect rates are open matching defects / total defects raised. The total
+                      // is deduplicated by defect ID and includes defects closed during this gate
+                      // session. Group names and types are case-insensitive.
+                      defectGroups: [
+                        octaneDefectGroup(
+                            name: env.OCTANE_MAJOR_DEFECT_GROUP_NAME,
+                            types: env.OCTANE_MAJOR_DEFECT_TYPES),
+                        octaneDefectGroup(
+                            name: env.OCTANE_MINOR_DEFECT_GROUP_NAME,
+                            types: env.OCTANE_MINOR_DEFECT_TYPES)
+                      ],
+                      criteria: env.OCTANE_CRITERIA,
+                      scopes: [
+                        octaneGateScope(
+                            name: env.OCTANE_CRITICAL_SCOPE_NAME,
+                            suiteRunId: criticalSuiteRunSource)
+                      ],
+                      pollIntervalSeconds: pollIntervalSeconds,
+                      timeoutMinutes: timeoutMinutes,
+                      timeoutMinutesExtended: timeoutMinutesExtended,
+                      basePassrateFigure: basePassrateFigure,
+                      baseExecutionFigure: baseExecutionFigure,
+                      markUnstable: markUnstable,
+                      riskHeatMap: riskHeatMap,
+                      riskHeatMapDefectQuery: env.OCTANE_RISK_HEAT_MAP_DEFECT_QUERY,
+                      riskHeatMapMaxDefects: riskHeatMapMaxDefects)
+
+              env.OCTANE_GATE_PASSED = gateResult.passed == true ? 'true' : 'false'
+              echo "Octane criteria verdict: ${gateResult.passed ? 'PASS' : 'FAIL'}"
+              echo "Octane suite run IDs: ${gateResult.suiteRunIds.join(', ')}"
+              if (gateResult.regressionEvaluationEnabled) {
+                echo "Regression execution rate: ${gateResult.regressions.executionRate}"
+                echo "Regression pass rate: ${gateResult.regressions.passRate}"
+              }
+              Map scopeResults = gateResult.scopes as Map
+              def criticalScope = scopeResults.get(env.OCTANE_CRITICAL_SCOPE_NAME)
+              if (criticalScope != null && criticalScope.active != false) {
+                echo "Critical scope execution rate: ${criticalScope.executionRate}"
+                echo "Critical scope pass rate: ${criticalScope.passRate}"
+              } else {
+                echo 'Critical scope is inactive because no selected suite runs remain.'
+              }
+            }
+          }
+        }
+      }
+    }
+
+    stage('Email Octane Report') {
+      steps {
+        octaneEmailReport(
+            to: env.OCTANE_EMAIL_TO,
+            cc: env.OCTANE_EMAIL_CC,
+            bcc: env.OCTANE_EMAIL_BCC,
+            projectName: env.OCTANE_PROJECT_NAME,
+            domainName: env.OCTANE_DOMAIN_NAME,
+            from: env.OCTANE_EMAIL_FROM,
+            replyTo: env.OCTANE_EMAIL_REPLY_TO,
+            subject:
+                "(automated) QE OCTANE GATE REPORT Job #${env.BUILD_NUMBER} "
+                    + "Time {{DURATION}} | {{EAT_DATE}} | ${env.OCTANE_PROJECT_NAME}",
+            body: '''Hello Team,
+
+The automated job for {{PROJECT_NAME}} tests has run for {{DURATION}} and is {{GATE_RESULT}}.
+
+Set criteria: {{CRITERIA}}
+
+Click here to {{REPORT_LINK}}.
+
+See below the execution details:
+
+{{EXECUTION_DETAILS}}
+
+{{REPORT_SCREENSHOT}}
+
+Thanks.
+QA Automation Team''',
+            onFailure: env.OCTANE_FINAL_EMAIL_ON_FAILURE,
+            printDefectGroups: env.OCTANE_EMAIL_PRINT_DEFECT_GROUPS.toBoolean(),
+            projectSummary: env.PROJECT_SUMMARY,
+            printProjectSummaryOnIntervalEmails:
+                env.PRINT_PROJECT_SUMMARY_ON_INTERVAL_EMAILS.toBoolean(),
+            printDefectsOnEmailBody: env.PRINT_DEFECTS_ON_EMAIL_BODY.toBoolean(),
+            printDefectsOnEmailBodyFilter: env.PRINT_DEFECTS_ON_EMAIL_BODY_FILTER,
+            printDefectsOnEmailBodyLimit: env.PRINT_DEFECTS_ON_EMAIL_BODY_LIMIT.toInteger(),
+            theme: env.OCTANE_EMAIL_THEME,
+            browserPath: env.BROWSERPATH,
+            viewportWidth: env.OCTANE_EMAIL_VIEWPORT_WIDTH.toInteger(),
+            archiveScreenshot: env.OCTANE_FINAL_EMAIL_ARCHIVE_SCREENSHOT.toBoolean(),
+            important: env.OCTANE_FINAL_EMAIL_IS_IMPORTANT.toBoolean())
+      }
+    }
+  }
+}

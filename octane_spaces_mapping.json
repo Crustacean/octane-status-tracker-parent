@@ -1,0 +1,35 @@
+{
+    "shared_url": "https://octane.example.com",
+    "shared_spaces": [
+        {
+            "sharedSpaceId": "900001",
+            "sharedSpaceName": "Example Shared Space 1",
+            "specific_url": "",
+            "workspaces": [
+                {
+                    "workspaceId": "700001",
+                    "workspaceName": "Example Workspace 1"
+                },
+                {
+                    "workspaceId": "700002",
+                    "workspaceName": "Example Workspace 2"
+                }
+            ]
+        },
+        {
+            "sharedSpaceId": "900002",
+            "sharedSpaceName": "Example Shared Space 2",
+            "specific_url": "",
+            "workspaces": [
+                {
+                    "workspaceId": "700101",
+                    "workspaceName": "Example Workspace 101"
+                },
+                {
+                    "workspaceId": "700102",
+                    "workspaceName": "Example Workspace 102"
+                }
+            ]
+        }
+    ]
+}
