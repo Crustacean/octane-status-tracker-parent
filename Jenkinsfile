@@ -465,7 +465,12 @@ def updateArgoCdGitOpsState(
 }
 
 pipeline {
-  agent any
+  // The child loads this Pipeline inside its node and parent checkout directory.
+  agent none
+
+  options {
+    skipDefaultCheckout(true)
+  }
 
   environment {
     // Runtime values are applied after this Declarative environment scope is created.
