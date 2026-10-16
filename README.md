@@ -22,6 +22,13 @@ The dashboard authenticates Octane polling with `OCTANE_API_CREDENTIAL_ID`, reso
 from `apiCredentialId` in the spaces mapping or the normalized shared-space name.
 Optional ArgoCD synchronization uses its separate `ARGOCD_GIT_CREDENTIAL_ID`.
 
+The mapping's `shared_url` and nonblank `specific_url` must contain Jenkins **Secret text
+credential IDs**, not URLs. Create `octane-shared-url` with the HTTPS Octane host root
+(for example `https://octane.example.com`) as its secret value. A blank `specific_url`
+inherits `shared_url`. The parent passes the selected ID unchanged to the plugin, which
+resolves it in the executing job's credential context. URL credentials and API
+Username with password credentials must both be accessible to that job.
+
 ## Handoff Regression Check
 
 With Groovy installed and the parent and child repositories checked out side by side:
